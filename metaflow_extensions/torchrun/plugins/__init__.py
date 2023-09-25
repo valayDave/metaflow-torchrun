@@ -1,5 +1,6 @@
 from metaflow.plugins.parallel_decorator import ParallelDecorator, _local_multinode_control_task_step_func, UBF_CONTROL
 from metaflow.exception import MetaflowException
+from metaflow import current
 from functools import partial
 import subprocess
 import socket
@@ -9,30 +10,78 @@ import os
 
 NODE_STARTED_VAR = "torchrun_node_started"
 
+class TorchRunExecutor:
+
+    def __init__(self, 
+                 pathspec,
+                 main_addr, 
+                 main_port, 
+                 num_nodes, 
+                 node_index, 
+                 ) -> None:
+        
+        self.torchrun_args = {
+            "rdzv-id": pathspec,
+            "rdzv_endpoint": "%s:%s" % (main_addr, main_port),
+            "nnodes": num_nodes, 
+            "master_addr": main_addr,
+            "master_port": main_port, # batch doesn't matter. k8s depends on port opened in @kubernetes jobset. 
+            "node_rank": node_index,
+            "rdzv-backend": "c10d",
+            # TODO add max-restarts
+        }
+    
+    def run(self, entrypoint, entry_point_args=None, entrypoint_args_raw=None, nproc_per_node=1):
+        """
+        `entry_point_args` : Dict | None
+        `entrypoint_args_raw` : List[str] | None
+            Either `entry_point_args` or `entrypoint_args_raw` must be provided. Both cannot be provided.
+        """
+        if entry_point_args is not None and entrypoint_args_raw is not None:
+            raise ValueError("Only one of `entry_point_args` or `entrypoint_args_raw` can be provided.")
+        
+        self._ensure_torch_installed()
+        cmd = ["torchrun"] 
+        
+        for arg, val in dict(**self.torchrun_args, nproc_per_node=nproc_per_node).items():
+            cmd.extend(["--%s" % arg, str(val)])
+        cmd.append(entrypoint)
+        
+        if entry_point_args is not None:
+            for arg, val in entry_point_args.items():
+                cmd.extend(["--%s" % arg, str(val)])
+        elif entrypoint_args_raw is not None:
+            cmd.extend(entrypoint_args_raw)
+        
+        subprocess.run(cmd, check=True)
+
+    
+    def _ensure_torch_installed(self):
+        try:
+            import torch
+        except ImportError:
+            raise MetaflowException("PyTorch is not installed. Please install PyTorch before using the torchrun_parallel decorator.")
+
 
 class TorchrunDecoratorParallel(ParallelDecorator):
 
     name = "torchrun_parallel"
     defaults = {
         "master_port": None,
-        "torchrun_args": {
-            "nproc_per_node": 1, # could tune this
-            "max-restarts": 3,   # could tune this, relate to Metaflow retry_count
-        },
-        "entrypoint": "trainer.py",
-        "entrypoint_args": {},
         "all_nodes_started_timeout": 300
     }
     IS_PARALLEL = True
 
-    def _torchrun_process(self, ubf_context):
+    def _setup_current(self, main_port,  ubf_context):
 
         from metaflow import current
 
-        if os.environ.get("METAFLOW_RUNTIME_ENVIRONMENT", "local") == "local":
-            torchrun_args = {}
-        else:
+        main_addr = current.parallel.main_ip
+        num_nodes = current.parallel.num_nodes
+        node_index = current.parallel.node_index
 
+        # TODO : Fixme: find a way these come only from `current` to ensure implementation hygiene.
+        if not os.environ.get("METAFLOW_RUNTIME_ENVIRONMENT", "local") == "local":
             # collect variables from environment
             if "AWS_BATCH_JOB_ID" in os.environ:
                 num_nodes = int(os.environ["AWS_BATCH_JOB_NUM_NODES"])
@@ -46,75 +95,21 @@ class TorchrunDecoratorParallel(ParallelDecorator):
                 num_nodes = int(os.environ["WORLD_SIZE"])
                 node_index = int(os.environ["RANK"])
                 main_addr = os.environ["MASTER_ADDR"]
-
-            main_port = "3339"
         
-            # create torchrun args
-            torchrun_args = {
-                "rdzv-id": "123",
-                "rdzv_endpoint": "%s:%s" % (main_addr, main_port),
-                "nnodes": num_nodes, 
-                "master_addr": main_addr,
-                "master_port": main_port, # batch doesn't matter. k8s depends on port opened in @kubernetes jobset. 
-                "node_rank": node_index,
-                "nproc_per_node": 1, # TODO: set to N visible devices on node
-                "rdzv-backend": "c10d",
-            }
-
-        # apply user overrides in @torchrun_parallel decorator.
-        torchrun_args.update(self.attributes['torchrun_args'])
-
-        # setup torchrun part of command
-        cmd = ["torchrun"]
-        for arg, val in torchrun_args.items():
-            cmd.extend(["--%s" % arg, str(val)])
-
-        # setup torch user script part of command
-        cmd.append(self.attributes['entrypoint'])
-        if isinstance(self.attributes['entrypoint_args'], str):
-            cmd.append(self.attributes['entrypoint_args'])
-        elif isinstance(self.attributes['entrypoint_args'], dict):
-            for arg, val in self.attributes['entrypoint_args'].items():
-                cmd.extend(["--%s" % arg, str(val)])
-        else:
-            raise TypeError("entrypoint_args must be a dict or str")
-
-        self.cmd = " ".join(cmd)
-        subprocess.run(cmd, check=True)
-
-    def task_decorate(
-        self, step_func, flow, graph, retry_count, max_user_code_retries, ubf_context
-    ):
-
-        def _torchrun_with_step_func_postprocessing():
-            self._ensure_torch_installed()
-            self._torchrun_process(ubf_context)
-            setattr(flow, "command", " ".join(self.cmd))
-            step_func()
-        if (
-            ubf_context == UBF_CONTROL
-            and os.environ.get("METAFLOW_RUNTIME_ENVIRONMENT", "local") == "local"
-        ):
-            from functools import partial
-            env_to_use = getattr(self.environment, "base_env", self.environment)
-            return partial(
-                _local_multinode_control_task_step_func,
-                flow,
-                env_to_use,
-                _torchrun_with_step_func_postprocessing,
-                retry_count,
-            )
-        else:
-            return _torchrun_with_step_func_postprocessing
-
-    def _ensure_torch_installed(self):
-        try:
-            import torch
-        except ImportError:
-            print("PyTorch is not installed. Installing the latest version of the torch package from PyPi.")
-            subprocess.run([sys.executable, "-m", "pip", "install", "-U", "torch"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            import torch
-
+        torch_executor = TorchRunExecutor(
+            pathspec=current.pathspec,
+            main_addr=main_addr,
+            main_port=main_port,
+            num_nodes=num_nodes,
+            node_index=node_index, 
+        )
+        current._update_env({
+            "torch" : torch_executor
+        })
+    
+    def task_pre_step(self, step_name, task_datastore, metadata, run_id, task_id, flow, graph, retry_count, max_user_code_retries, ubf_context, inputs):
+        self._setup_current(self.attributes["master_port"], ubf_context)
+ 
 def get_backend():
     try:
         import torch
